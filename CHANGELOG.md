@@ -9,6 +9,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-17
+
 ### Security
 
 - Key, certificate and account-URL files are now written atomically: a fresh `0600` temp file created with `O_CREAT | O_EXCL | O_NOFOLLOW`, `fsync`ed, given its final mode (`0600` for keys, `0644` for the public chain) and `rename`d into place, then the directory is `fsync`ed. A symlink planted at `key.pem`/`cert.pem`/`account_key.pem` is replaced instead of written through, and readers never see a partial file.
