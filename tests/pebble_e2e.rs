@@ -12,6 +12,7 @@
 
 use armature_acme::{AcmeClient, AcmeConfig};
 use armature_testkit::acme::PebbleCa;
+use rustls_pki_types::{CertificateDer, pem::PemObject};
 
 /// Pebble's interface root certificate (PEM), taken from the image itself.
 ///
@@ -87,8 +88,7 @@ async fn order_certificate_end_to_end() {
         );
 
         // Parse the leaf to prove it is a real certificate.
-        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
-        let leaf = rustls_pemfile::certs(&mut reader)
+        let leaf = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
             .next()
             .expect("at least one cert in chain")
             .expect("valid cert DER");
