@@ -1,5 +1,6 @@
 /// ACME client configuration
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// ACME directory URLs for common providers
 pub mod directories {
@@ -30,8 +31,17 @@ pub enum ChallengeType {
     TlsAlpn01,
 }
 
+/// Default TCP/TLS connect timeout for requests to the ACME CA.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default total (connect + send + receive) timeout for one request to the
+/// ACME CA.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// ACME client configuration
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the EAB HMAC key so the configuration can be logged safely.
+#[derive(Clone)]
 pub struct AcmeConfig {
     /// ACME directory URL
     pub directory_url: String,
@@ -68,6 +78,43 @@ pub struct AcmeConfig {
     /// Use this to talk to a private or test ACME CA (e.g. Pebble/Boulder)
     /// whose HTTPS interface is signed by a root not in the system trust store.
     pub ca_certificate: Option<Vec<u8>>,
+
+    /// Timeout for establishing a connection to the CA
+    /// (default [`DEFAULT_CONNECT_TIMEOUT`]).
+    pub connect_timeout: Duration,
+
+    /// Total timeout for a single request to the CA, including reading the
+    /// response body (default [`DEFAULT_REQUEST_TIMEOUT`]).
+    pub request_timeout: Duration,
+}
+
+impl std::fmt::Debug for AcmeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcmeConfig")
+            .field("directory_url", &self.directory_url)
+            .field("contact_email", &self.contact_email)
+            .field("domains", &self.domains)
+            .field("challenge_type", &self.challenge_type)
+            .field("cert_dir", &self.cert_dir)
+            .field("account_dir", &self.account_dir)
+            .field("renew_before_days", &self.renew_before_days)
+            .field("accept_tos", &self.accept_tos)
+            .field("eab_kid", &self.eab_kid)
+            .field(
+                "eab_hmac_key",
+                &self.eab_hmac_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "ca_certificate",
+                &self
+                    .ca_certificate
+                    .as_ref()
+                    .map(|c| format!("<{} bytes>", c.len())),
+            )
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
 }
 
 impl AcmeConfig {
@@ -101,6 +148,8 @@ impl AcmeConfig {
             eab_kid: None,
             eab_hmac_key: None,
             ca_certificate: None,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 
@@ -194,6 +243,24 @@ impl AcmeConfig {
         self.ca_certificate = Some(pem);
         self
     }
+
+    /// Set the connect and total per-request timeouts for talking to the CA.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use armature_acme::AcmeConfig;
+    /// use std::time::Duration;
+    ///
+    /// let config = AcmeConfig::default()
+    ///     .with_timeouts(Duration::from_secs(5), Duration::from_secs(20));
+    /// assert_eq!(config.request_timeout, Duration::from_secs(20));
+    /// ```
+    pub fn with_timeouts(mut self, connect: Duration, request: Duration) -> Self {
+        self.connect_timeout = connect;
+        self.request_timeout = request;
+        self
+    }
 }
 
 impl Default for AcmeConfig {
@@ -258,6 +325,27 @@ mod tests {
         assert_eq!(config.cert_dir, PathBuf::from("/etc/certs"));
         assert_eq!(config.renew_before_days, 14);
         assert!(config.accept_tos);
+    }
+
+    #[test]
+    fn debug_redacts_eab_hmac_key() {
+        let config = AcmeConfig::zerossl(
+            vec!["admin@example.com".to_string()],
+            vec!["example.com".to_string()],
+            "kid123".to_string(),
+            "super-secret-hmac".to_string(),
+        );
+        let dbg = format!("{config:?}");
+        assert!(!dbg.contains("super-secret-hmac"), "{dbg}");
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(dbg.contains("kid123"));
+    }
+
+    #[test]
+    fn default_timeouts_are_bounded() {
+        let config = AcmeConfig::default();
+        assert_eq!(config.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(config.request_timeout, DEFAULT_REQUEST_TIMEOUT);
     }
 
     #[test]

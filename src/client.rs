@@ -8,6 +8,8 @@ use crate::{
     jws::{self, AccountKey, KeyRef, Payload},
     order::{Order, OrderStatus},
 };
+use reqwest::Url;
+use rustls_pki_types::{CertificateDer, pem::PemObject};
 use serde_json::{Value, json};
 use std::path::Path;
 use tokio::sync::Mutex;
@@ -73,6 +75,9 @@ impl AcmeResponse {
 pub struct AcmeClient {
     config: AcmeConfig,
     directory: Directory,
+    /// Parsed directory URL; every URL the client sends a request to must
+    /// share its origin.
+    origin: Url,
     http_client: reqwest::Client,
     account_key: Option<AccountKey>,
     account_url: Option<String>,
@@ -99,9 +104,23 @@ impl AcmeClient {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`AcmeError::InvalidDirectory`] when `directory_url` is not
+    /// an `https://` URL, or when the directory advertises an endpoint on a
+    /// different origin than the directory itself.
     pub async fn new(config: AcmeConfig) -> Result<Self> {
+        let origin = require_https(&config.directory_url)?;
+
+        // `https_only` also stops a redirect from downgrading a request to
+        // plain HTTP; the timeouts keep a slow or hostile CA from hanging the
+        // renewal task forever.
         let mut builder = reqwest::Client::builder()
             .use_rustls_tls()
+            .https_only(true)
+            .connect_timeout(config.connect_timeout)
+            .timeout(config.request_timeout)
             .user_agent(concat!("armature-acme/", env!("CARGO_PKG_VERSION")));
 
         if let Some(pem) = &config.ca_certificate {
@@ -118,6 +137,7 @@ impl AcmeClient {
         Ok(Self {
             config,
             directory,
+            origin,
             http_client,
             account_key: None,
             account_url: None,
@@ -125,8 +145,10 @@ impl AcmeClient {
         })
     }
 
-    /// Fetch the ACME directory.
+    /// Fetch the ACME directory and check that every endpoint it advertises is
+    /// on the directory's own origin.
     async fn fetch_directory(client: &reqwest::Client, url: &str) -> Result<Directory> {
+        let origin = require_https(url)?;
         let response = client.get(url).send().await?;
 
         if !response.status().is_success() {
@@ -136,8 +158,17 @@ impl AcmeClient {
             )));
         }
 
-        let directory = response.json().await?;
+        let directory: Directory = response.json().await?;
+        validate_directory(&directory, &origin)?;
         Ok(directory)
+    }
+
+    /// Refuse to send a request (and, for signed requests, a JWS) to a URL
+    /// that is not on the CA's origin. Order, authorization, challenge,
+    /// finalize and certificate URLs all come from CA responses, so this keeps
+    /// a tampered response from steering the client at another host.
+    fn check_origin(&self, url: &str, what: &str) -> Result<()> {
+        require_same_origin(&self.origin, url, what)
     }
 
     // ----- nonce management -------------------------------------------------
@@ -155,6 +186,7 @@ impl AcmeClient {
         if let Some(n) = self.nonce.lock().await.take() {
             return Ok(n);
         }
+        self.check_origin(&self.directory.new_nonce, "newNonce")?;
         let response = self
             .http_client
             .head(&self.directory.new_nonce)
@@ -177,6 +209,7 @@ impl AcmeClient {
             .account_key
             .as_ref()
             .ok_or_else(|| AcmeError::InvalidAccount("account key not initialized".into()))?;
+        self.check_origin(url, "request")?;
 
         // Retry budget for the anti-replay nonce. A CA may reject a nonce
         // (Pebble deliberately rejects a fraction of good nonces); each retry
@@ -292,9 +325,9 @@ impl AcmeClient {
             return AccountKey::from_pkcs8(der);
         }
         let key = AccountKey::generate()?;
-        std::fs::create_dir_all(&self.config.account_dir)?;
+        create_private_dir(&self.config.account_dir)?;
         set_dir_perms(&self.config.account_dir);
-        write_secret_file(&path, jws::pkcs8_to_pem(key.pkcs8_der()).as_bytes())?;
+        write_file_atomic(&path, jws::pkcs8_to_pem(key.pkcs8_der()).as_bytes(), 0o600)?;
         Ok(key)
     }
 
@@ -376,11 +409,12 @@ impl AcmeClient {
         let account_url = resp.location.ok_or_else(|| {
             AcmeError::InvalidAccount("newAccount response had no Location header".into())
         })?;
+        self.check_origin(&account_url, "account URL")?;
         self.account_url = Some(account_url.clone());
 
         // Persist the account URL (best effort).
-        if std::fs::create_dir_all(&self.config.account_dir).is_ok() {
-            let _ = std::fs::write(self.account_url_path(), &account_url);
+        if create_private_dir(&self.config.account_dir).is_ok() {
+            let _ = write_file_atomic(&self.account_url_path(), account_url.as_bytes(), 0o600);
         }
 
         Ok(())
@@ -462,6 +496,9 @@ impl AcmeClient {
                         "authorization {auth_url} has no {wanted} challenge"
                     ))
                 })?;
+            // The token ends up in URLs and, for HTTP-01 webroot setups, in
+            // filesystem paths — reject anything that is not base64url.
+            validate_challenge_token(&challenge.token)?;
 
             out.push(Http01Challenge {
                 token: challenge.token.clone(),
@@ -626,11 +663,10 @@ impl AcmeClient {
         }
 
         let pem = std::fs::read(cert_path)?;
-        let mut reader = std::io::BufReader::new(pem.as_slice());
         // A corrupt/truncated/empty cert file is treated the same as a
         // missing one: renew rather than silently skip (fail-open-to-outage
         // would leave a renewal daemon never renewing a damaged cert).
-        let leaf = match rustls_pemfile::certs(&mut reader).next().transpose() {
+        let leaf = match CertificateDer::pem_slice_iter(&pem).next().transpose() {
             Ok(Some(leaf)) => leaf,
             Ok(None) | Err(_) => return Ok(true),
         };
@@ -656,8 +692,6 @@ impl AcmeClient {
         cert_pem: &str,
         key_pem: &str,
     ) -> Result<(String, String)> {
-        use std::fs;
-
         if cert_pem.trim().is_empty() || !cert_pem.contains("-----BEGIN CERTIFICATE-----") {
             return Err(AcmeError::CertificateError(
                 "refusing to save empty or non-PEM certificate".into(),
@@ -669,13 +703,16 @@ impl AcmeClient {
             ));
         }
 
-        fs::create_dir_all(&self.config.cert_dir)?;
+        create_private_dir(&self.config.cert_dir)?;
 
         let cert_path = self.config.cert_dir.join("cert.pem");
         let key_path = self.config.cert_dir.join("key.pem");
 
-        fs::write(&cert_path, cert_pem)?;
-        write_secret_file(&key_path, key_pem.as_bytes())?;
+        // Write the key first: a crash between the two renames then leaves a
+        // new key with the old cert (detected as a mismatch) rather than a
+        // world-readable window for the key. The chain is public material.
+        write_file_atomic(&key_path, key_pem.as_bytes(), 0o600)?;
+        write_file_atomic(&cert_path, cert_pem.as_bytes(), 0o644)?;
 
         Ok((
             cert_path.to_string_lossy().to_string(),
@@ -708,41 +745,145 @@ fn challenge_type_id(challenge_type: ChallengeType) -> &'static str {
     }
 }
 
-/// Write private key material, creating the file `0600` **before** any bytes
-/// are written.
-///
-/// Writing first and `chmod`-ing after leaves a umask-dependent window in which
-/// the key is group/world-readable, so the mode is set at create time instead.
-#[cfg(unix)]
-fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+/// Parse `url` and require the `https` scheme.
+fn require_https(url: &str) -> Result<Url> {
+    let parsed = Url::parse(url)
+        .map_err(|e| AcmeError::InvalidDirectory(format!("invalid ACME directory URL: {e}")))?;
+    if parsed.scheme() != "https" {
+        return Err(AcmeError::InvalidDirectory(format!(
+            "ACME directory URL must use https, got scheme {:?}",
+            parsed.scheme()
+        )));
+    }
+    Ok(parsed)
+}
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(contents)?;
-    // An existing file keeps its old mode through `open`, so re-assert it.
-    set_file_perms(path);
+/// Require `url` to parse and share `base`'s origin (scheme, host and port).
+fn require_same_origin(base: &Url, url: &str, what: &str) -> Result<()> {
+    let parsed = Url::parse(url)
+        .map_err(|e| AcmeError::InvalidDirectory(format!("invalid {what} URL from CA: {e}")))?;
+    if parsed.origin() != base.origin() {
+        return Err(AcmeError::InvalidDirectory(format!(
+            "{what} URL {parsed} is not on the ACME directory's origin {}",
+            base.origin().ascii_serialization()
+        )));
+    }
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, contents)
+/// Check that every endpoint a directory advertises is on `origin`.
+fn validate_directory(directory: &Directory, origin: &Url) -> Result<()> {
+    require_same_origin(origin, &directory.new_account, "newAccount")?;
+    require_same_origin(origin, &directory.new_order, "newOrder")?;
+    require_same_origin(origin, &directory.new_nonce, "newNonce")?;
+    require_same_origin(origin, &directory.revoke_cert, "revokeCert")?;
+    if let Some(key_change) = &directory.key_change {
+        require_same_origin(origin, key_change, "keyChange")?;
+    }
+    Ok(())
 }
 
+/// Create `dir` (and missing parents) with mode `0700` on Unix.
+///
+/// Directories that already exist keep their mode: they may be shared,
+/// operator-managed locations. The atomic write below does not depend on the
+/// directory being private.
 #[cfg(unix)]
-fn set_file_perms(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
 }
 
 #[cfg(not(unix))]
-fn set_file_perms(_path: &Path) {}
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// Atomically replace `path` with `contents`.
+///
+/// The bytes go to a fresh sibling temp file created `0600` with
+/// `O_CREAT | O_EXCL | O_NOFOLLOW` — so a pre-planted file or symlink at the
+/// temp name makes the write fail instead of being followed — and are
+/// `fsync`ed before the file is given its final `mode` and `rename`d over
+/// `path`. `rename` replaces a symlink at `path` rather than writing through
+/// it, and readers only ever see the old or the complete new file. The
+/// directory is `fsync`ed afterwards so the rename survives a crash.
+#[cfg(unix)]
+fn write_file_atomic(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let tmp = dir.join(temp_name(path));
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)?;
+    let result = (|| {
+        file.write_all(contents)?;
+        // `mode` above is filtered through the umask; set it exactly.
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn write_file_atomic(path: &Path, contents: &[u8], _mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let tmp = dir.join(temp_name(path));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let result = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// A hidden, unpredictable sibling temp-file name for `path`.
+fn temp_name(path: &Path) -> String {
+    use ring::rand::SecureRandom;
+
+    let mut nonce = [0u8; 8];
+    // `SystemRandom` failing is not recoverable in practice; fall back to a
+    // fixed suffix, which `O_EXCL` still makes safe (the write just fails if
+    // the name is taken).
+    let _ = ring::rand::SystemRandom::new().fill(&mut nonce);
+    let suffix: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!(".{base}.{}.{suffix}.tmp", std::process::id())
+}
 
 #[cfg(unix)]
 fn set_dir_perms(path: &Path) {
@@ -792,6 +933,7 @@ mod tests {
                 key_change: None,
                 meta: None,
             },
+            origin: Url::parse("https://ca.example/directory").unwrap(),
             http_client: reqwest::Client::new(),
             account_key: None,
             account_url: None,
@@ -864,6 +1006,151 @@ mod tests {
         for d in &domains {
             assert!(found.contains(d), "CSR SANs {found:?} must contain {d}");
         }
+    }
+
+    #[test]
+    fn directory_url_must_be_https() {
+        assert!(require_https("https://acme.example/dir").is_ok());
+        for bad in [
+            "http://acme.example/dir",
+            "ftp://acme.example/dir",
+            "file:///etc/passwd",
+            "not a url",
+        ] {
+            assert!(
+                matches!(require_https(bad), Err(AcmeError::InvalidDirectory(_))),
+                "accepted {bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn new_rejects_plain_http_directory_without_network() {
+        let config = AcmeConfig::new(
+            "http://127.0.0.1:9/directory",
+            vec![],
+            vec!["example.com".into()],
+        );
+        let err = AcmeClient::new(config).await.unwrap_err();
+        assert!(matches!(err, AcmeError::InvalidDirectory(_)), "{err}");
+    }
+
+    #[test]
+    fn directory_endpoints_must_share_origin() {
+        let origin = Url::parse("https://ca.example/directory").unwrap();
+        let good = Directory {
+            new_account: "https://ca.example/acme/new-acct".into(),
+            new_order: "https://ca.example/acme/new-order".into(),
+            new_nonce: "https://ca.example/acme/new-nonce".into(),
+            revoke_cert: "https://ca.example/acme/revoke".into(),
+            key_change: Some("https://ca.example/acme/key-change".into()),
+            meta: None,
+        };
+        assert!(validate_directory(&good, &origin).is_ok());
+
+        for (field, url) in [
+            ("new_account", "https://evil.example/acme/new-acct"),
+            ("new_order", "http://ca.example/acme/new-order"),
+            ("new_nonce", "https://ca.example:8443/acme/new-nonce"),
+            ("revoke_cert", "https://ca.example.evil.example/revoke"),
+            ("key_change", "https://169.254.169.254/latest"),
+        ] {
+            let mut d = good.clone();
+            match field {
+                "new_account" => d.new_account = url.into(),
+                "new_order" => d.new_order = url.into(),
+                "new_nonce" => d.new_nonce = url.into(),
+                "revoke_cert" => d.revoke_cert = url.into(),
+                _ => d.key_change = Some(url.into()),
+            }
+            assert!(
+                validate_directory(&d, &origin).is_err(),
+                "accepted off-origin {field} = {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_requests_refuse_off_origin_urls() {
+        let mut client = offline_client(AcmeConfig::default());
+        client.account_key = Some(AccountKey::generate().unwrap());
+        client.account_url = Some("https://ca.example/acme/acct/1".into());
+
+        // Fails at the origin check, before any nonce fetch or network I/O.
+        let err = client
+            .post_as_get::<Value>("https://evil.example/acme/order/1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AcmeError::InvalidDirectory(_)), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_sets_mode_and_replaces_symlink_without_following() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("acme-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_private_dir(&dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        // A symlink planted at the key path must be replaced, not written through.
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"original").unwrap();
+        let key = dir.join("key.pem");
+        std::os::unix::fs::symlink(&victim, &key).unwrap();
+
+        write_file_atomic(&key, b"secret", 0o600).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original");
+        let meta = std::fs::symlink_metadata(&key).unwrap();
+        assert!(meta.file_type().is_file(), "symlink was followed");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&key).unwrap(), b"secret");
+
+        // Public material gets the requested mode; no temp files are left.
+        let cert = dir.join("cert.pem");
+        write_file_atomic(&cert, b"chain", 0o644).unwrap();
+        assert_eq!(
+            std::fs::metadata(&cert).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_certificate_creates_private_dir_and_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("acme-perms-{}/certs", std::process::id()));
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        let client = offline_client(AcmeConfig::default().with_cert_dir(dir.clone()));
+        let (_, key_path) = client
+            .save_certificate(
+                "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n",
+                "-----BEGIN PRIVATE KEY-----\nxyz\n-----END PRIVATE KEY-----\n",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[tokio::test]
